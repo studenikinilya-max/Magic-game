@@ -375,15 +375,12 @@ def tg_webhook():
 
 # === Polling thread ===
 def polling_loop():
-    while True:
-        try:
-            poll_once()
-        except Exception as e:
-            print(f"polling error: {e}")
-        time.sleep(60)
+    """Polling loop - отключён по умолчанию, используй /poll endpoint."""
+    print("Polling disabled - use /poll endpoint")
+    return
 
-# Запускаем polling в фоне
-threading.Thread(target=polling_loop, daemon=True).start()
+# Запускаем polling в фоне (отключено — используй внешний cron)
+# threading.Thread(target=polling_loop, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
