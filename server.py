@@ -125,9 +125,7 @@ def poll_once():
             
             msg_id = last.get("id", "")
             key = f"{cid}_{msg_id}"
-            if key in sent:
-                continue
-            sent[key] = int(time.time())
+            # НЕ скипаем по дедупликации — бот уже отправит, Telegram поймёт если reply "да"
             
             # Item info
             ctx = c.get("context", {})
@@ -356,6 +354,61 @@ def poll():
     n = poll_once()
     return jsonify({"status": "polling_executed", "new_count": n})
 
+@app.route("/force-send")
+def force_send():
+    """Принудительно отправить черновик для первого неотвеченного чата."""
+    try:
+        token = get_token()
+        r = requests.get(f"https://api.avito.ru/messenger/v2/accounts/{USER_ID}/chats",
+            headers={"Authorization": f"Bearer {token}"}, params={"limit": 50}, timeout=15)
+        chats = r.json().get("chats", [])
+        for c in chats[:10]:
+            cid = c["id"]
+            users = c.get("users", [])
+            other = next((u for u in users if u.get("id") != USER_ID), {})
+            name = other.get("name", "?")
+            r2 = requests.get(f"https://api.avito.ru/messenger/v3/accounts/{USER_ID}/chats/{cid}/messages",
+                headers={"Authorization": f"Bearer {token}"}, params={"limit": 3}, timeout=10)
+            msgs = r2.json().get("messages", [])
+            if not msgs:
+                continue
+            last = msgs[0]
+            if last.get("author_id") == USER_ID:
+                continue
+            text = last.get("content", {}).get("text", "")
+            if not text or "Системное сообщение" in text:
+                continue
+            
+            ctx = c.get("context", {})
+            item_id = ctx.get("value", {}).get("id") if isinstance(ctx.get("value"), dict) else None
+            item_title = "объявление"
+            item_price = "?"
+            if item_id:
+                r3 = requests.get(f"https://api.avito.ru/core/v1/items?user_id={USER_ID}&per_page=100",
+                    headers={"Authorization": f"Bearer {token}"}, timeout=10)
+                items = r3.json().get("resources", [])
+                item = next((i for i in items if i.get("id") == item_id), None)
+                if item:
+                    item_title = item.get("title", "объявление")
+                    item_price = item.get("price", "?")
+            
+            fname = is_cyrillic_name(name)
+            
+            notif = f"""🔔 <b>FORCE: Новое сообщение</b>
+👤 Имя: {name}
+💬 Чат: <code>{cid}</code>
+📦 {item_title}
+💵 {item_price} ₽
+
+📨 Текст: {text[:200]}
+
+Ответь <b>да</b> / <b>нет</b>"""
+            send_tg(notif)
+            return jsonify({"status": "sent", "chat_id": cid, "name": name})
+        return jsonify({"status": "no_pending"})
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
 @app.route("/clear")
 def clear():
     """Очистить state для нового polling."""
@@ -375,12 +428,17 @@ def tg_webhook():
 
 # === Polling thread ===
 def polling_loop():
-    """Polling loop - отключён по умолчанию, используй /poll endpoint."""
-    print("Polling disabled - use /poll endpoint")
-    return
+    """Polling каждые 30 сек, шлёт черновики для всех неотвеченных чатов."""
+    while True:
+        try:
+            n = poll_once()
+            print(f"polling cycle done: {n}")
+        except Exception as e:
+            print(f"polling error: {e}")
+        time.sleep(30)
 
-# Запускаем polling в фоне (отключено — используй внешний cron)
-# threading.Thread(target=polling_loop, daemon=True).start()
+# Запускаем polling в фоне
+threading.Thread(target=polling_loop, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
