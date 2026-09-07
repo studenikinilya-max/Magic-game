@@ -1,193 +1,302 @@
+#!/usr/bin/env python3
 """
-Avito Webhook Server для MAGIC | GAME
-Получает webhook от Авито → шлёт Илье в Телеграм → ловит ответ → шлёт в Авито
+Webhook server for Avito + Polling trigger.
+Render cron job pings /poll every 1 min to check new messages.
 """
 import os
+import time
 import json
-import asyncio
 import requests
 from datetime import datetime
-from flask import Flask, request, jsonify
-import telebot
-from telebot import types
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ============ КОНФИГ ============
-AVITO_CLIENT_ID = "37JdRroSViO7DszyZokh"
-AVITO_CLIENT_SECRET = "cpLQcyFUcDCi94UDB9oUQz0afFc-64VAtHOIWzXl"
-AVITO_USER_ID = "220388146"
+# === Config ===
+CLIENT_ID = os.environ.get("AVITO_CLIENT_ID", "37JdRroSViO7DszyZokh")
+CLIENT_SECRET = os.environ.get("AVITO_CLIENT_SECRET", "cpLQcyFUcDCi94UDB9oUQz0afFc-64VAtHOIWzXl")
+USER_ID = int(os.environ.get("AVITO_USER_ID", "220388146"))
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8850826923:AAEquMIf3KIYbBjwKxNHWyRjI-lFELjn0ns")
+TELEGRAM_CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", "1046557548"))
 
-TELEGRAM_BOT_TOKEN = "8850826923:AAEquMIf3KIYbBjwKxNHWyRjI-lFELjn0ns"
-TELEGRAM_OWNER_ID = 1046557548  # Илья
-TOPIC_AVITO_QUESTIONS = 652566  # раздел "Авито вопросы"
+# === Prices ===
+PS5_TITLES = {
+    8303523403: "PS5 + Подписка Deluxe",
+    8303837408: "PS5 Slim с дисководом",
+    8303089089: "PS5 Slim без дисковода",
+    8302978306: "PS5 с дисководом",
+    8335432496: "PS5 без дисковода",
+}
 
-app = Flask(__name__)
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+# === Skip ===
+SKIP_NAMES = ["GameShOp - PlayStation", "Moonqueen Store"]
+SKIP_CHATS = ["u2i-n~ofJ4ijZkxJP6meVWIAcw"]
 
-# Хранилище: chat_id -> message_id в Телеграме
-pending_messages = {}
+# === State ===
+processed_messages = set()
+last_check_time = 0
 
-# ============ АВИТО API ============
 
-def get_avito_token():
-    """Получить токен Авито"""
-    r = requests.post("https://api.avito.ru/token",
-        auth=(AVITO_CLIENT_ID, AVITO_CLIENT_SECRET),
-        data={"grant_type": "client_credentials"})
+def first_name(full_name: str) -> str:
+    if not full_name or full_name == "Пользователь":
+        return ""
+    name = full_name.split()[0] if full_name else ""
+    if not name:
+        return ""
+    first = name[0]
+    rest = name[1:]
+    if first.isupper() and all('А' <= c <= 'я' or c in 'ёЁ' for c in rest):
+        return name
+    return ""
+
+
+def get_token():
+    r = requests.post(
+        "https://api.avito.ru/token",
+        auth=(CLIENT_ID, CLIENT_SECRET),
+        data={"grant_type": "client_credentials"}
+    )
     return r.json().get("access_token")
 
-def send_avito_message(chat_id, text):
-    """Отправить сообщение в Авито"""
-    token = get_avito_token()
-    r = requests.post(
-        f"https://api.avito.ru/messenger/v1/accounts/{AVITO_USER_ID}/chats/{chat_id}/messages",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        json={"type": "text", "message": {"text": text}}
-    )
-    return r.status_code in [200, 201]
 
-def get_chat_info(chat_id):
-    """Получить инфо о чате"""
-    token = get_avito_token()
-    r = requests.get(
-        f"https://api.avito.ru/messenger/v2/accounts/{AVITO_USER_ID}/chats/{chat_id}",
-        headers={"Authorization": f"Bearer {token}"}
-    )
-    if r.status_code == 200:
-        data = r.json()
-        users = data.get("users", [])
-        other = next((u for u in users if str(u.get("id")) != AVITO_USER_ID), {})
-        ctx = data.get("context", {})
-        item = ctx.get("value", {}) if isinstance(ctx.get("value"), dict) else {}
+def send_telegram(text: str):
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            params={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            timeout=10
+        )
+        return r.status_code == 200
+    except Exception as e:
+        print(f"Telegram error: {e}")
+        return False
+
+
+def check_chat(chat, token, H):
+    cid = chat["id"]
+    if cid in SKIP_CHATS:
+        return None
+    users = chat.get("users", [])
+    other = next((u for u in users if u.get("id") != USER_ID), {})
+    name = other.get("name", "")
+    if name in SKIP_NAMES:
+        return None
+    try:
+        r = requests.get(
+            f"https://api.avito.ru/messenger/v3/accounts/{USER_ID}/chats/{cid}/messages",
+            headers=H, params={"limit": 5}, timeout=5
+        )
+        msgs = r.json().get("messages", [])
+        if not msgs:
+            return None
+        last = msgs[0]
+        msg_id = last.get("id", "")
+        if msg_id in processed_messages:
+            return None
+        if last.get("author_id") == USER_ID:
+            processed_messages.add(msg_id)
+            return None
+        text = last.get("content", {}).get("text", "")
+        if not text:
+            return None
+        if "Системное сообщение" in text or "Ассистент Авито" in text:
+            processed_messages.add(msg_id)
+            return None
+        t = text.lower()
+        if any(w in t for w in ["купил", "уже купил", "спасибо", "успехов", "понял", "принял"]):
+            processed_messages.add(msg_id)
+            return None
+        digits = text.replace("+", "").replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+        if digits.isdigit() and len(digits) >= 10:
+            processed_messages.add(msg_id)
+            return {
+                "chat_id": cid, "name": name, "user_id": other.get("id"),
+                "text": text, "type": "phone", "fname": first_name(name)
+            }
+        ctx = chat.get("context", {})
+        item_id = ctx.get("value", {}).get("id") if isinstance(ctx.get("value"), dict) else None
+        last_ilya = None
+        for m in msgs:
+            if m.get("author_id") == USER_ID:
+                last_ilya = m.get("content", {}).get("text", "")
+                break
+        processed_messages.add(msg_id)
         return {
-            "client_name": other.get("name", "Клиент"),
-            "client_id": other.get("id"),
-            "item_title": item.get("title", ""),
-            "item_price": item.get("price_string", ""),
-            "item_url": item.get("url", ""),
+            "chat_id": cid, "name": name, "user_id": other.get("id"),
+            "text": text[:500], "item_id": item_id, "type": "message",
+            "last_ilya": last_ilya[:200] if last_ilya else None,
+            "fname": first_name(name)
         }
-    return None
-
-def get_chat_messages(chat_id, limit=5):
-    """Получить последние сообщения"""
-    token = get_avito_token()
-    r = requests.get(
-        f"https://api.avito.ru/messenger/v3/accounts/{AVITO_USER_ID}/chats/{chat_id}/messages",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        params={"limit": limit}
-    )
-    if r.status_code == 200:
-        return r.json().get("messages", [])
-    return []
-
-# ============ TELEGRAM ============
-
-def send_to_telegram(chat_id_avito, msg_text):
-    """Отправить сообщение из Авито в Телеграм"""
-    info = get_chat_info(chat_id_avito)
-    if not info:
+    except Exception:
         return None
 
-    # Получить последние сообщения для контекста
-    msgs = get_chat_messages(chat_id_avito, 5)
 
-    text = f"""🔔 **Новое сообщение в Авито**
+def make_draft(p):
+    name = p.get("name", "?")
+    fname = p.get("fname", "")
+    text = p.get("text", "")
+    item_id = p.get("item_id")
+    msg_type = p.get("type", "message")
+    last_ilya = p.get("last_ilya")
 
-👤 Клиент: {info['client_name']}
-📦 Объявление: {info['item_title']}
-💰 Цена: {info['item_price']}
+    item_title = PS5_TITLES.get(item_id, "?")
+    item_price_map = {8303523403: 79990, 8303837408: 58990, 8303089089: 55490,
+                      8302978306: 54990, 8335432496: 51490, 8111685512: 590}
+    item_price = item_price_map.get(item_id, 0)
 
-💬 Последнее сообщение клиента:
-{msg_text}
+    if msg_type == "phone":
+        return f"{fname + ', ' if fname else ''}хорошо, принял 👍\n\nНомер записал, жду деталей по комплекту."
 
-🔗 Чат ID: `{chat_id_avito}`
-🔗 Объявление: {info['item_url']}
+    if not last_ilya or "Здравствуйте" not in last_ilya:
+        if item_id in PS5_TITLES:
+            return f"""{fname + ', ' if fname else ''}здравствуйте 🤝
 
-👇 **Ответь РЕПЛАЕМ на это сообщение — твой ответ уйдёт клиенту в Авито**"""
+Вас приветствует команда MAGIC | GAME
 
-    msg = bot.send_message(TELEGRAM_OWNER_ID, text, parse_mode='Markdown')
-    pending_messages[chat_id_avito] = msg.message_id
-    return msg.message_id
+На связи Илья — готов помочь и ответить на любой вопрос! 🎮
 
-# ============ TELEGRAM BOT HANDLERS ============
+Немного расскажу про нас ⚡
 
-@bot.message_handler(func=lambda message: message.reply_to_message is not None)
-def handle_reply(message):
-    """Обработка реплая Ильи — отправка в Авито"""
-    if message.from_user.id != TELEGRAM_OWNER_ID:
-        return
+Работаем в сфере PS давно, на 3 города 🏙
 
-    # Найти какой chat_id соответствует этому сообщению
-    target_chat_id = None
-    for cid, msg_id in pending_messages.items():
-        if msg_id == message.reply_to_message.message_id:
-            target_chat_id = cid
+🎮 Что предлагаем:
+▫️ PS5 Fat / Slim / Pro — с дисководом и без
+▫️ Геймпады, док-станции, диски, игры
+▫️ Подписки PS Plus
+▫️ Соберём комплект под вас 🔧
+
+🤝 Как работаем:
+1️⃣ Обсуждаем комплект заранее
+2️⃣ Готовлю всё к встрече
+3️⃣ Приезжаете — всё настроено и проверено
+4️⃣ После покупки — на связи 24/7
+
+Что интересует? Напишите, подберём комплект 👍
+
+---
+
+По объявлению, на которое вы написали — {item_title}, цена {item_price} ₽ ✅
+
+Подскажите, какой комплект рассматриваете?"""
+        else:
+            return f"""{fname + ', ' if fname else ''}здравствуйте 🤝
+
+Вас приветствует команда MAGIC | GAME
+
+На связи Илья — готов помочь и ответить на любой вопрос! 🎮
+
+Какой вопрос вас интересует?"""
+
+    t = text.lower()
+    if any(w in t for w in ["цена", "стоит", "сколько", "прайс", "стоит ли"]):
+        if item_id in PS5_TITLES:
+            return f"По объявлению, на которое вы написали — {item_title}, цена {item_price} ₽ ✅\n\nЧто-то добавим или базовый комплект?"
+    if any(w in t for w in ["доставка", "отправить", "привезти"]):
+        return "Доставка возможна, стоимость зависит от адреса 📦\n\nУточните, пожалуйста, ваш район — посчитаю?"
+    if any(w in t for w in ["гарантия", "возврат"]):
+        return "Гарантия 14 дней на проверку ✅\n\nЕсли что-то не понравится — возврат без вопросов."
+    if "подписка" in t or "ps plus" in t.lower() or any(w in t for w in ["essential", "extra", "deluxe"]):
+        return """🎮 Что входит в тарифы
+
+▫️ Extra (440 игр) — сюжетные:
+GTA V, Mortal Kombat, God of War
+Horizon, Detroit, Spider-Man, The Last of Us
+
+▫️ Deluxe (770 игр) — максимум:
+Всё что в Extra + классика PS1/PS2 + стриминг облака
+
+Оба тарифа дают возможность играть по сети ✅
+
+Что интересует?"""
+    if any(w in t for w in ["ревизия", "ревизии", "китайская"]):
+        return """В наличии у нас много приставок. Ревизии тоже бывают разные. Между собой ревизии особо ничем не отличаются. Единственный момент: есть китайские ревизии, которые мы не закупаем, потому что там с трудностью добавляются аккаунты и приносят неудобства ✅"""
+    if any(w in t for w in ["состояние", "разбиралас", "вскрывалас", "ремонт"]):
+        return "Приставка в отличном состоянии, не вскрывалась, не ремонтировалась. Гарантию на неё мы предоставляем 👍"
+
+    return f"{fname + ', ' if fname else ''}понял 👍\n\nПодскажите, что хотите уточнить?"
+
+
+def do_poll():
+    """Check all chats for new messages"""
+    global last_check_time
+    token = get_token()
+    if not token:
+        return {"error": "no token"}
+
+    H = {"Authorization": f"Bearer {token}"}
+    pending_list = []
+
+    all_chats = []
+    for offset in [0, 50, 100, 150]:
+        r = requests.get(
+            f"https://api.avito.ru/messenger/v2/accounts/{USER_ID}/chats",
+            headers=H, params={"limit": 50, "offset": offset}
+        )
+        chats = r.json().get("chats", [])
+        if not chats:
             break
+        all_chats.extend(chats)
 
-    if not target_chat_id:
-        bot.reply_to(message, "❌ Не нашёл чат Авито для этого сообщения")
-        return
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(check_chat, c, token, H): c for c in all_chats}
+        for f in as_completed(futures):
+            result = f.result()
+            if result:
+                pending_list.append(result)
 
-    text = message.text
-    success = send_avito_message(target_chat_id, text)
+    for p in pending_list:
+        draft = make_draft(p)
+        msg = f"""📬 <b>Новый чат</b>
 
-    if success:
-        bot.reply_to(message, f"✅ Отправлено в Авито (chat {target_chat_id[:15]}...)")
-        del pending_messages[target_chat_id]
-    else:
-        bot.reply_to(message, "❌ Ошибка отправки в Авито")
+<b>Клиент:</b> {p.get('fname', '') or p.get('name', '?')}
+<b>Чат:</b> <code>{p.get('chat_id')}</code>
+<b>Объявление:</b> {p.get('item_id')}
 
-# ============ WEBHOOK ENDPOINTS ============
+<b>Клиент написал:</b>
+{p.get('text', '')}
 
-@app.route('/')
+<b>Черновик ответа:</b>
+{draft}
+
+Утверждаешь — отправлю. Скажи «да»."""
+        send_telegram(msg)
+
+    last_check_time = time.time()
+    return {"pending": len(pending_list), "total_checked": len(all_chats)}
+
+
+# === Flask ===
+from flask import Flask, request, jsonify
+app = Flask(__name__)
+
+
+@app.route("/")
 def home():
-    return "Avito Webhook Server for MAGIC | GAME is running"
+    return "Avito Webhook Server for MAGIC | GAME is running", 200
 
-@app.route('/health')
+
+@app.route("/health")
 def health():
-    return jsonify({"status": "ok", "timestamp": datetime.now().isoformat()})
+    return jsonify({"status": "ok", "timestamp": datetime.utcnow().isoformat()}), 200
 
-@app.route('/avito-webhook', methods=['POST'])
+
+@app.route("/avito-webhook", methods=["POST"])
 def avito_webhook():
-    """Webhook от Авито — новое сообщение"""
+    """Handle incoming webhook from Avito"""
     data = request.json
-    print(f"[Webhook] Получено: {json.dumps(data, ensure_ascii=False)[:500]}")
-
-    # Определить тип события
-    event_type = data.get("type")
-    payload = data.get("payload", {})
-
-    if event_type == "message":
-        chat_id = payload.get("chat_id")
-        author_id = payload.get("author_id")
-        text = payload.get("value", "")
-
-        # Только сообщения от клиентов (не от нас)
-        if author_id != int(AVITO_USER_ID) and text:
-            send_to_telegram(chat_id, text)
-
+    print(f"📥 Webhook received: {data}")
+    send_telegram(f"🔔 Avito webhook: {json.dumps(data, ensure_ascii=False)[:500]}")
     return jsonify({"status": "ok"}), 200
 
-@app.route('/register-webhook', methods=['POST'])
-def register_webhook():
-    """Регистрация webhook в Авито"""
-    url = request.json.get("url")
-    if not url:
-        return jsonify({"error": "url required"}), 400
 
-    token = get_avito_token()
-    r = requests.post(
-        "https://api.avito.ru/messenger/v3/webhook",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        json={"url": url}
-    )
-    return jsonify({
-        "status_code": r.status_code,
-        "response": r.json() if r.status_code in [200, 201] else r.text
-    })
+@app.route("/poll", methods=["GET", "POST"])
+def poll():
+    """Triggered by cron job to check for new messages"""
+    try:
+        result = do_poll()
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-if __name__ == '__main__':
-    # Запуск Flask + Telegram bot
-    import threading
-    bot_thread = threading.Thread(target=lambda: bot.polling(none_stop=True), daemon=True)
-    bot_thread.start()
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
