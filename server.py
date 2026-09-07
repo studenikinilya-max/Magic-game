@@ -1,122 +1,92 @@
 #!/usr/bin/env python3
 """
-Avito Bot — polling сервер для MAGIC | GAME.
-Каждые 60 секунд проверяет новые сообщения в Авито и шлёт черновики в Телеграм.
+Avito Bot Server для MAGIC | GAME.
+- Polling Avito каждые 60 сек
+- Отправка черновиков в Telegram
+- Приём ответов Ильи через Telegram webhook
+- Автоотправка в Avito по подтверждению
 """
 import os
 import time
 import json
-import requests
 import threading
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
+from flask import Flask, request, jsonify
 
 # === Config ===
 CLIENT_ID = os.environ.get("AVITO_CLIENT_ID", "37JdRroSViO7DszyZokh")
 CLIENT_SECRET = os.environ.get("AVITO_CLIENT_SECRET", "cpLQcyFUcDCi94UDB9oUQz0afFc-64VAtHOIWzXl")
 USER_ID = int(os.environ.get("AVITO_USER_ID", "220388146"))
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8850826923:AAEquMIf3KIYbBjwKxNHWyRjI-lFELjn0ns")
-TELEGRAM_CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", "1046557548"))
-
-# === Skip ===
-SKIP_NAMES = ["GameShOp - PlayStation", "Moonqueen Store"]
-SKIP_CHATS = ["u2i-n~ofJ4ijZkxJP6meVWIAcw"]
-END_PHRASES = ["купил", "уже купил", "спасибо", "успехов", "🤝", "👍", "понял", "принял", "ладно", "договорились", "хорошо"]
+TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8850826923:AAEquMIf3KIYbBjwKxNHWyRjI-lFELjn0ns")
+TG_CHAT = int(os.environ.get("TELEGRAM_CHAT_ID", "1046557548"))
 
 # === State ===
 SENT_FILE = "/tmp/sent_notifications.json"
+PENDING_FILE = "/tmp/pending_drafts.json"
 
-def load_sent():
+SKIP_NAMES = ["GameShOp - PlayStation", "Moonqueen Store"]
+SKIP_CHATS = ["u2i-n~ofJ4ijZkxJP6meVWIAcw"]
+END_PHRASES = ["купил", "уже купил", "спасибо", "успехов", "понял", "принял", "ладно", "договорились"]
+
+# === Helpers ===
+def load_json(path, default):
     try:
-        with open(SENT_FILE) as f:
+        with open(path) as f:
             return json.load(f)
     except:
-        return {}
+        return default
 
-def save_sent(sent):
+def save_json(path, data):
     try:
-        os.makedirs(os.path.dirname(SENT_FILE), exist_ok=True)
-    except:
-        pass
-    with open(SENT_FILE, "w") as f:
-        json.dump(sent, f, indent=2)
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"save error: {e}")
 
-# === Avito ===
 def get_token():
     r = requests.post("https://api.avito.ru/token",
         auth=(CLIENT_ID, CLIENT_SECRET),
         data={"grant_type": "client_credentials"}, timeout=10)
     return r.json().get("access_token")
 
-def get_chats(token):
-    all_chats = []
-    for offset in [0, 50, 100]:
-        r = requests.get(f"https://api.avito.ru/messenger/v2/accounts/{USER_ID}/chats",
-            headers={"Authorization": f"Bearer {token}"},
-            params={"limit": 50, "offset": offset}, timeout=15)
-        chats = r.json().get("chats", [])
-        if not chats:
-            break
-        all_chats.extend(chats)
-    return all_chats
+def is_cyrillic_name(name):
+    if not name or name == "Пользователь":
+        return ""
+    parts = name.split()
+    if not parts:
+        return ""
+    n = parts[0]
+    if not n[0].isupper():
+        return ""
+    for c in n[1:]:
+        if not (("А" <= c <= "я") or c in "ёЁ" or c in "-"):
+            return ""
+    return n
 
-def get_messages(token, chat_id):
-    r = requests.get(f"https://api.avito.ru/messenger/v3/accounts/{USER_ID}/chats/{chat_id}/messages",
-        headers={"Authorization": f"Bearer {token}"},
-        params={"limit": 5}, timeout=10)
-    return r.json().get("messages", [])
-
-def get_item(token, item_id):
-    r = requests.get(f"https://api.avito.ru/core/v1/items?user_id={USER_ID}&per_page=100",
-        headers={"Authorization": f"Bearer {token}"}, timeout=10)
-    items = r.json().get("resources", [])
-    return next((i for i in items if i.get("id") == item_id), None)
-
-def get_item_info(token, item_id):
-    """Получает полную инфу по объявлению через прямой запрос"""
-    # Используем список items (там есть title и price)
-    return None  # Заглушка, реально используем get_item
-
-# === Telegram ===
-def send_telegram(text):
-    r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-        params={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
+def send_tg(text):
+    r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+        json={"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML"}, timeout=10)
     return r.status_code == 200
 
-# === Logic ===
-def detect_template(text, item_price, item_title):
-    """Формирует черновик ответа"""
-    t = text.lower().strip()
-    
-    # Имя
-    return item_title, item_price
-
-def is_cyrillic_name(name):
-    """Проверяет: имя кириллица с заглавной?"""
-    if not name or name == "Пользователь":
-        return False
-    name = name.split()[0] if " " in name else name
-    if not name:
-        return False
-    first = name[0]
-    rest = name[1:]
-    if not first.isupper():
-        return False
-    # Проверяем что все буквы кириллица
-    for c in rest:
-        if not (("А" <= c <= "я") or c in "ёЁ" or c in "-"):
-            return False
-    return True
+def send_avito(token, chat_id, text):
+    url = f"https://api.avito.ru/messenger/v1/accounts/{USER_ID}/chats/{chat_id}/messages"
+    return requests.post(url,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={"type": "text", "message": {"text": text}}, timeout=10)
 
 # === Polling ===
 def poll_once():
     try:
         token = get_token()
-        chats = get_chats(token)
-        sent = load_sent()
+        sent = load_json(SENT_FILE, {})
+        pending = load_json(PENDING_FILE, {})
+        new = 0
         
-        new_count = 0
-        for c in chats[:50]:
+        r = requests.get(f"https://api.avito.ru/messenger/v2/accounts/{USER_ID}/chats",
+            headers={"Authorization": f"Bearer {token}"}, params={"limit": 50}, timeout=15)
+        chats = r.json().get("chats", [])
+        
+        for c in chats:
             cid = c["id"]
             if cid in SKIP_CHATS:
                 continue
@@ -128,7 +98,9 @@ def poll_once():
             if name in SKIP_NAMES:
                 continue
             
-            msgs = get_messages(token, cid)
+            r2 = requests.get(f"https://api.avito.ru/messenger/v3/accounts/{USER_ID}/chats/{cid}/messages",
+                headers={"Authorization": f"Bearer {token}"}, params={"limit": 5}, timeout=10)
+            msgs = r2.json().get("messages", [])
             if not msgs:
                 continue
             
@@ -137,66 +109,48 @@ def poll_once():
                 continue
             
             text = last.get("content", {}).get("text", "")
-            if not text:
-                continue
-            if "Системное сообщение" in text:
+            if not text or "Системное сообщение" in text:
                 continue
             
-            # Проверяем завершающие фразы
             t = text.lower()
             if any(ep in t for ep in END_PHRASES):
                 continue
             
-            created = last.get("created", 0)
-            
-            # Свежее 10 минут
-            if created < time.time() - 600:
-                continue
-            
-            # Дедупликация
             msg_id = last.get("id", "")
             key = f"{cid}_{msg_id}"
             if key in sent:
                 continue
             sent[key] = int(time.time())
             
-            # Получаем инфу об объявлении
+            # Item info
             ctx = c.get("context", {})
             item_id = ctx.get("value", {}).get("id") if isinstance(ctx.get("value"), dict) else None
             item_title = "объявление"
             item_price = "?"
-            
             if item_id:
-                item = get_item(token, item_id)
+                r3 = requests.get(f"https://api.avito.ru/core/v1/items?user_id={USER_ID}&per_page=100",
+                    headers={"Authorization": f"Bearer {token}"}, timeout=10)
+                items = r3.json().get("resources", [])
+                item = next((i for i in items if i.get("id") == item_id), None)
                 if item:
                     item_title = item.get("title", "объявление")
                     item_price = item.get("price", "?")
             
-            # Имя
-            fname = ""
-            if is_cyrillic_name(name):
-                fname = name.split()[0]
+            fname = is_cyrillic_name(name)
             
-            # Проверяем — только цифры (телефон)?
+            # Phone number - send immediately
             digits = text.replace("+", "").replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
             if digits.isdigit() and len(digits) >= 10:
-                # Телефон — отвечаем "Хорошо, принял"
                 if fname:
                     reply = f"{fname}, хорошо, принял 👍"
                 else:
                     reply = "Хорошо, принял 👍"
-                # Отправляем сразу
-                url = f"https://api.avito.ru/messenger/v1/accounts/{USER_ID}/chats/{cid}/messages"
-                requests.post(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                    json={"type": "text", "message": {"text": reply}}, timeout=10)
+                send_avito(token, cid, reply)
                 continue
             
-            # Формируем черновик
-            greeting = f"{fname}, здравствуйте 🤝" if fname else "Здравствуйте 🤝"
-            
-            if "цена" in t or "стоит" in t or "сколько" in t or "прайс" in t or "актуально" in t:
-                # Вопрос про цену
-                draft = f"""{greeting}
+            # Build draft based on text
+            if any(w in t for w in ["цена", "стоит", "сколько", "прайс"]):
+                draft = f"""{fname + ', ' if fname else ''}здравствуйте 🤝
 
 Базовый комплект ⚡️
 ▫️ {item_title}
@@ -208,12 +162,12 @@ def poll_once():
 
 🎮 Также можем добавить:
 ▫️ 2-й геймпад — +5 500 ₽
-▫️ Подписку PS Plus Extra/Deluxe
-▫️ Док-станцию, диски с играми
+▫️ Подписка PS Plus Extra/Deluxe
+▫️ Док-станция, диски с играми
 
 Подскажите, какой комплект рассматриваете? Интересуют допы?"""
-            elif "актуальн" in t or "объявлен" in t:
-                draft = f"""{greeting}
+            elif "актуальн" in t:
+                draft = f"""{fname + ', ' if fname else ''}здравствуйте 🤝
 
 По объявлению, на которое вы написали — {item_title}, цена {item_price} ₽ ✅
 
@@ -221,53 +175,164 @@ def poll_once():
 
 🎮 Можем добавить:
 ▫️ 2-й геймпад — +5 500 ₽
-▫️ Подписку PS Plus
-▫️ Док-станцию, диски
+▫️ Подписка PS Plus
+▫️ Док-станция, диски
 
 Подскажите, какой комплект?"""
-            else:
-                # Общий случай
-                draft = f"""{greeting}
+            elif any(w in t for w in ["пристав", "ps5", "ps 5", "купить"]):
+                draft = f"""{fname + ', ' if fname else ''}здравствуйте 🤝
 
 Вас приветствует команда MAGIC | GAME
 
-На связи Илья — готов помочь и ответить на любой вопрос! 🎮
-
 По объявлению, на которое вы написали — {item_title}, цена {item_price} ₽ ✅
+
+Базовый комплект ⚡️
+▫️ {item_title}
+▫️ Оригинальный геймпад
+▫️ Полный комплект проводов
+▫️ Личный аккаунт
 
 🎮 Также можем добавить:
 ▫️ 2-й геймпад — +5 500 ₽
-▫️ Подписку PS Plus Extra/Deluxe
-▫️ Док-станцию, диски с играми
+▫️ Подписка PS Plus
+▫️ Док-станция, диски
 
 Подскажите, какой комплект рассматриваете?"""
+            else:
+                draft = f"""{fname + ', ' if fname else ''}здравствуйте 🤝
+
+По объявлению, на которое вы написали — {item_title} ✅
+
+Подскажите, что хотите уточнить?"""
             
-            # Отправляем черновик в Телеграм
+            # Save draft for this chat
+            pending[cid] = {
+                "draft": draft,
+                "name": name,
+                "fname": fname,
+                "item_title": item_title,
+                "item_price": item_price,
+                "client_text": text,
+                "created_at": int(time.time()),
+            }
+            
+            # Send to Telegram
             notif = f"""🔔 <b>Новое сообщение</b>
-👤 Имя: {name if name else '?'} ({'кириллица' if fname else 'без имени'})
+👤 Имя: {name} ({'кириллица' if fname else 'без имени'})
 💬 Чат: <code>{cid}</code>
-📦 Объявление: {item_title}
-💵 Цена: {item_price} ₽
+📦 {item_title}
+💵 {item_price} ₽
 
-📨 <b>Текст клиента:</b>
-{text[:300]}
+📨 Текст клиента:
+{text[:200]}
 
-📝 <b>Черновик ответа:</b>
+📝 <b>Черновик:</b>
 {draft}
 
-Отправлять? (да/нет)"""
-            
-            if send_telegram(notif):
-                new_count += 1
+Ответь: <b>да</b> / <b>нет</b> / <b>свой текст</b>"""
+            if send_tg(notif):
+                new += 1
         
-        save_sent(sent)
-        return new_count
+        save_json(SENT_FILE, sent)
+        save_json(PENDING_FILE, pending)
+        return new
     except Exception as e:
         return f"error: {e}"
 
-# === Flask (для Render healthcheck) ===
-from flask import Flask, jsonify
+# === Telegram webhook (слушает ответы Ильи) ===
+def handle_tg_update(update):
+    """Обрабатывает сообщение от Ильи в Telegram."""
+    try:
+        msg = update.get("message", {})
+        chat_id = msg.get("chat", {}).get("id")
+        text = msg.get("text", "").strip()
+        
+        if str(chat_id) != str(TG_CHAT):
+            return  # Чужой чат
+        
+        if not text:
+            return
+        
+        # Проверяем формат: "да CHAT_ID" или просто "да"
+        parts = text.split(maxsplit=1)
+        cmd = parts[0].lower()
+        arg = parts[1] if len(parts) > 1 else None
+        
+        pending = load_json(PENDING_FILE, {})
+        
+        # Получить список ожидающих
+        if not pending:
+            send_tg("❌ Нет черновиков для отправки")
+            return
+        
+        if cmd == "нет":
+            # Отменить все или конкретный
+            if arg:
+                pending.pop(arg, None)
+                save_json(PENDING_FILE, pending)
+                send_tg(f"🗑 Черновик для чата {arg} отменён")
+            else:
+                pending.clear()
+                save_json(PENDING_FILE, pending)
+                send_tg("🗑 Все черновики отменены")
+            return
+        
+        if cmd == "список":
+            lines = ["📋 Ожидающие черновики:"]
+            for cid, p in pending.items():
+                lines.append(f"• {p['name']} ({cid})")
+            send_tg("\n".join(lines))
+            return
+        
+        # Определить какой чат
+        target_cid = arg
+        if not target_cid and len(pending) == 1:
+            target_cid = list(pending.keys())[0]
+        
+        if not target_cid or target_cid not in pending:
+            send_tg(f"❌ Уточните chat_id. Черновики: {', '.join(pending.keys())}")
+            return
+        
+        p = pending[target_cid]
+        custom_text = None
+        
+        if cmd in ["да", "отправляй", "ok", "ok"]:
+            # Отправить черновик
+            text_to_send = p["draft"]
+        elif cmd == "свой":
+            # Свой текст после "свой"
+            custom_text = arg.replace("свой ", "", 1).strip() if arg and arg.startswith("свой ") else None
+            if not custom_text:
+                send_tg(f"❌ После 'свой' укажи текст: свой ТЕКСТ {target_cid}")
+                return
+            text_to_send = custom_text
+        elif cmd.startswith("прав"):
+            # правка текста
+            custom_text = arg.replace("прав ", "", 1).strip() if arg and arg.startswith("прав ") else None
+            if not custom_text:
+                send_tg(f"❌ После 'прав' укажи текст: прав ТЕКСТ {target_cid}")
+                return
+            text_to_send = custom_text
+        else:
+            # Любой другой текст = пользовательский ответ
+            text_to_send = text
+        
+        # Отправить в Avito
+        try:
+            token = get_token()
+            r = send_avito(token, target_cid, text_to_send)
+            if r.status_code in [200, 201]:
+                pending.pop(target_cid, None)
+                save_json(PENDING_FILE, pending)
+                send_tg(f"✅ Отправлено в чат {target_cid}")
+            else:
+                send_tg(f"❌ Ошибка Avito: {r.status_code} {r.text[:200]}")
+        except Exception as e:
+            send_tg(f"❌ Ошибка: {e}")
+    except Exception as e:
+        print(f"handle_tg_update error: {e}")
 
+# === Flask app ===
 app = Flask(__name__)
 
 @app.route("/")
@@ -280,22 +345,28 @@ def health():
 
 @app.route("/poll")
 def poll():
-    count = poll_once()
-    return jsonify({"status": "polling_executed", "new_count": count})
+    """Ручной запуск polling (для теста)."""
+    n = poll_once()
+    return jsonify({"status": "polling_executed", "new_count": n})
 
-# === Background polling ===
-def background_polling():
-    """Каждые 60 секунд проверяет новые чаты"""
+@app.route("/tg-webhook", methods=["POST"])
+def tg_webhook():
+    """Принимает обновления от Telegram (для ответов Ильи)."""
+    update = request.json
+    handle_tg_update(update)
+    return jsonify({"ok": True})
+
+# === Polling thread ===
+def polling_loop():
     while True:
         try:
-            count = poll_once()
-            print(f"[{datetime.now().isoformat()}] Polled: {count} new")
+            poll_once()
         except Exception as e:
-            print(f"[{datetime.now().isoformat()}] Error: {e}")
+            print(f"polling error: {e}")
         time.sleep(60)
 
-# Запускаем polling в фоне при импорте
-threading.Thread(target=background_polling, daemon=True).start()
+# Запускаем polling в фоне
+threading.Thread(target=polling_loop, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
