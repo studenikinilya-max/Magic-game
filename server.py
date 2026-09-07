@@ -24,7 +24,7 @@ SKIP_CHATS = ["u2i-n~ofJ4ijZkxJP6meVWIAcw"]
 END_PHRASES = ["купил", "уже купил", "спасибо", "успехов", "🤝", "👍", "понял", "принял", "ладно", "договорились", "хорошо"]
 
 # === State ===
-SENT_FILE = "/workspace/.spru/sent_notifications.json"
+SENT_FILE = "/tmp/sent_notifications.json"
 
 def load_sent():
     try:
@@ -34,7 +34,10 @@ def load_sent():
         return {}
 
 def save_sent(sent):
-    os.makedirs(os.path.dirname(SENT_FILE), exist_ok=True)
+    try:
+        os.makedirs(os.path.dirname(SENT_FILE), exist_ok=True)
+    except:
+        pass
     with open(SENT_FILE, "w") as f:
         json.dump(sent, f, indent=2)
 
