@@ -349,6 +349,16 @@ def poll():
     n = poll_once()
     return jsonify({"status": "polling_executed", "new_count": n})
 
+@app.route("/clear")
+def clear():
+    """Очистить state для нового polling."""
+    try:
+        save_json(SENT_FILE, {})
+        save_json(PENDING_FILE, {})
+        return jsonify({"status": "cleared"})
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
 @app.route("/tg-webhook", methods=["POST"])
 def tg_webhook():
     """Принимает обновления от Telegram (для ответов Ильи)."""
