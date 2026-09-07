@@ -26,7 +26,9 @@ PENDING_FILE = "/tmp/pending_drafts.json"
 
 SKIP_NAMES = ["GameShOp - PlayStation", "Moonqueen Store"]
 SKIP_CHATS = ["u2i-n~ofJ4ijZkxJP6meVWIAcw"]
-END_PHRASES = ["купил", "уже купил", "спасибо", "успехов", "понял", "принял", "ладно", "договорились"]
+END_PHRASES = ["купил", "уже купил", "спасибо", "успехов", "ладно", "договорились"]
+# Точные финальные фразы (если клиент пишет ТОЛЬКО это)
+FINAL_REPLIES = ["понял", "принял", "👍", "🤝", "ок", "окей"]
 
 # === Helpers ===
 def load_json(path, default):
@@ -112,8 +114,13 @@ def poll_once():
             if not text or "Системное сообщение" in text:
                 continue
             
-            t = text.lower()
+            t = text.lower().strip()
             if any(ep in t for ep in END_PHRASES):
+                continue
+            
+            # Финальные фразы — только если сообщение состоит ТОЛЬКО из них
+            t_short = t.strip(".,!?👍🤝 ")
+            if t_short in FINAL_REPLIES:
                 continue
             
             msg_id = last.get("id", "")
